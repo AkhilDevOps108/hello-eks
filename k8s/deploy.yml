@@ -1,0 +1,29 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hello-eks
+  labels: { app: hello-eks }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: hello-eks }
+  template:
+    metadata:
+      labels: { app: hello-eks }
+    spec:
+      serviceAccountName: app-writer
+      containers:
+      - name: hello-eks
+        image: <ECR_REGISTRY>/hello-eks:__TAG__   # e.g. 123456789012.dkr.ecr.ap-south-1.amazonaws.com/hello-eks:__TAG__
+        ports: [{ containerPort: 8080 }]
+        env:
+        - name: BUCKET
+          value: "<BUCKET_NAME>"                  # from terraform output
+        - name: AWS_REGION
+          value: "ap-south-1"
+        readinessProbe:
+          httpGet: { path: /, port: 8080 }
+          initialDelaySeconds: 5
+        livenessProbe:
+          httpGet: { path: /, port: 8080 }
+          initialDelaySeconds: 10
