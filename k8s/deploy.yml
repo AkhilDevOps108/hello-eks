@@ -11,19 +11,16 @@ spec:
     metadata:
       labels: { app: hello-eks }
     spec:
-      serviceAccountName: app-writer
       containers:
       - name: hello-eks
-        image: <ECR_REGISTRY>/hello-eks:__TAG__   # e.g. 123456789012.dkr.ecr.ap-south-1.amazonaws.com/hello-eks:__TAG__
+        image: __IMAGE__
         ports: [{ containerPort: 8080 }]
         env:
-        - name: BUCKET
-          value: "<BUCKET_NAME>"                  # from terraform output
-        - name: AWS_REGION
-          value: "ap-south-1"
-        readinessProbe:
-          httpGet: { path: /, port: 8080 }
-          initialDelaySeconds: 5
-        livenessProbe:
-          httpGet: { path: /, port: 8080 }
-          initialDelaySeconds: 10
+        - { name: BUCKET,     value: "__BUCKET__" }
+        - { name: AWS_REGION, value: "__REGION__" }
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom: { secretKeyRef: { name: aws-creds, key: AWS_ACCESS_KEY_ID } }
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom: { secretKeyRef: { name: aws-creds, key: AWS_SECRET_ACCESS_KEY } }
+        readinessProbe: { httpGet: { path: /, port: 8080 }, initialDelaySeconds: 5 }
+        livenessProbe:  { httpGet: { path: /, port: 8080 }, initialDelaySeconds: 10 }

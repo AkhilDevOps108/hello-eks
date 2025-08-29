@@ -6,10 +6,10 @@ on:
   workflow_dispatch: {}
 
 env:
-  REGION: ap-south-1               # or use: ${{ secrets.AWS_REGION }}
-  CLUSTER: hello-eks               # hard-coded so --name is never empty
-  ECR_URI: ${{ secrets.ECR_URI }}  # e.g. 003364514435.dkr.ecr.ap-south-1.amazonaws.com/hello-eks
-  BUCKET_NAME: ${{ secrets.BUCKET_NAME }} # optional; leave empty to auto-create
+  REGION: ap-south-1
+  CLUSTER: hello-eks
+  ECR_URI: ${{ secrets.ECR_URI }}
+  BUCKET_NAME: ${{ secrets.BUCKET_NAME }}
 
 jobs:
   infra-build-deploy:
@@ -42,10 +42,10 @@ jobs:
       run: |
         set -euo pipefail
         if [ -z "${ECR_URI}" ]; then
-          echo "ECR_URI secret is required (e.g. 003364514435.dkr.ecr.ap-south-1.amazonaws.com/hello-eks)"; exit 1
+          echo "ECR_URI secret is required (e.g. 003364...amazonaws.com/hello-eks)"; exit 1
         fi
-        REGISTRY="${ECR_URI%/*}"      # 003364...amazonaws.com
-        REPO="${ECR_URI##*/}"         # hello-eks
+        REGISTRY="${ECR_URI%/*}"
+        REPO="${ECR_URI##*/}"
         echo "REGISTRY=$REGISTRY" >> $GITHUB_ENV
         echo "REPO=$REPO" >> $GITHUB_ENV
 
@@ -92,44 +92,13 @@ managedNodeGroups:
   minSize: 2
   maxSize: 3
   labels: { role: worker }
-  ssh:
-    allow: false
-iam:
-  withOIDC: true
+  ssh: { allow: false }
    YAML
           eksctl create cluster -f cluster.yaml
         else
           echo "Cluster ${CLUSTER} already exists."
         fi
         aws eks update-kubeconfig --name "$CLUSTER" --region "$REGION"
-
-    - name: Ensure OIDC and IRSA for S3 write
-      shell: bash
-      run: |
-        set -euo pipefail
-        eksctl utils associate-iam-oidc-provider --region "$REGION" --cluster "$CLUSTER" --approve || true
-        POLICY_NAME="${CLUSTER}-s3-policy"
-        POLICY_ARN=$(aws iam list-policies --scope Local --query "Policies[?PolicyName=='${POLICY_NAME}'].Arn" --output text)
-        if [ -z "$POLICY_ARN" ]; then
-          cat > s3-policy.json <<EOF
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    { "Effect": "Allow", "Action": ["s3:ListBucket"], "Resource": ["arn:aws:s3:::${BUCKET}"] },
-    { "Effect": "Allow", "Action": ["s3:GetObject","s3:PutObject"], "Resource": ["arn:aws:s3:::${BUCKET}/*"] }
-  ]
-}
- EOF
-          POLICY_ARN=$(aws iam create-policy --policy-name "$POLICY_NAME" --policy-document file://s3-policy.json --query Policy.Arn --output text)
-          echo "Created policy $POLICY_ARN"
-        fi
-        eksctl create iamserviceaccount \
-          --name app-writer \
-          --namespace default \
-          --cluster "$CLUSTER" \
-          --attach-policy-arn "$POLICY_ARN" \
-          --approve \
-          --override-existing-serviceaccounts
 
     - name: Login to ECR, Build & Push image
       shell: bash
@@ -141,14 +110,20 @@ iam:
         docker push "$IMAGE"
         echo "IMAGE=$IMAGE" >> $GITHUB_ENV
 
-    - name: Render & Apply manifests
+    - name: Create AWS creds secret in cluster (for pod)
+      shell: bash
+      run: |
+        kubectl delete secret aws-creds --ignore-not-found
+        kubectl create secret generic aws-creds \
+          --from-literal=AWS_ACCESS_KEY_ID='${{ secrets.AWS_ACCESS_KEY_ID }}' \
+          --from-literal=AWS_SECRET_ACCESS_KEY='${{ secrets.AWS_SECRET_ACCESS_KEY }}'
+
+    - name: Render & Apply manifests (no IRSA)
       shell: bash
       run: |
         set -euo pipefail
-        IRSA_ARN=$(kubectl get sa app-writer -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}')
         mkdir -p k8s_render
-        sed -e "s#__IRSA_ROLE_ARN__#${IRSA_ARN}#g" \
-            -e "s#__IMAGE__#${IMAGE}#g" \
+        sed -e "s#__IMAGE__#${IMAGE}#g" \
             -e "s#__BUCKET__#${BUCKET}#g" \
             -e "s#__REGION__#${REGION}#g" \
             k8s/deploy.tmpl.yaml > k8s_render/deploy.yaml
