@@ -96,7 +96,7 @@ managedNodeGroups:
     allow: false
 iam:
   withOIDC: true
-YAML
+   YAML
           eksctl create cluster -f cluster.yaml
         else
           echo "Cluster ${CLUSTER} already exists."
@@ -119,7 +119,7 @@ YAML
     { "Effect": "Allow", "Action": ["s3:GetObject","s3:PutObject"], "Resource": ["arn:aws:s3:::${BUCKET}/*"] }
   ]
 }
-EOF
+ EOF
           POLICY_ARN=$(aws iam create-policy --policy-name "$POLICY_NAME" --policy-document file://s3-policy.json --query Policy.Arn --output text)
           echo "Created policy $POLICY_ARN"
         fi
