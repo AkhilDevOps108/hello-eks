@@ -120,9 +120,9 @@ jobs:
           sed -e "s#__IMAGE__#${IMAGE}#g" \
               -e "s#__BUCKET__#${BUCKET}#g" \
               -e "s#__REGION__#${REGION}#g" \
-              k8s/deploy.yml > k8s_render/deploy.yaml
-          kubectl apply -f k8s_render/deploy.yaml
-          kubectl apply -f k8s/svc.yaml
+              k8s/deploy.yml > k8s_render/deploy.yml
+          kubectl apply -f k8s_render/deploy.yml
+          kubectl apply -f k8s/svc.yml
           kubectl rollout status deploy/hello-eks
 
       - name: Print Service external hostname
