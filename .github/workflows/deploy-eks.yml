@@ -1,0 +1,45 @@
+name: Build & Deploy to EKS
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  build-deploy:
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Configure AWS creds
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region:            ${{ secrets.AWS_REGION }}
+
+    - name: Login to ECR
+      id: ecr
+      uses: aws-actions/amazon-ecr-login@v2
+
+    - name: Build & push image
+      run: |
+        IMAGE=${{ secrets.ECR_REGISTRY }}/hello-eks:${{ github.sha }}
+        docker build -t $IMAGE ./app
+        docker push $IMAGE
+        echo "IMAGE=$IMAGE" >> $GITHUB_ENV
+
+    - name: Update kubeconfig
+      run: |
+        aws eks update-kubeconfig --name ${{ secrets.EKS_CLUSTER_NAME }} --region ${{ secrets.AWS_REGION }}
+
+    - name: Render and apply manifests
+      run: |
+        mkdir -p k8s_render
+        sed "s#__TAG__#${{ github.sha }}#g; s#<ECR_REGISTRY>#${{ secrets.ECR_REGISTRY }}#g; s#<BUCKET_NAME>#${{ secrets.BUCKET_NAME }}#g" k8s/deploy.yaml > k8s_render/deploy.yaml
+        kubectl apply -f k8s/sa-irsa.yaml
+        kubectl apply -f k8s_render/deploy.yaml
+        kubectl apply -f k8s/svc.yaml
+        kubectl rollout status deploy/hello-eks
