@@ -79,26 +79,16 @@ jobs:
         run: |
           set -euo pipefail
           if ! eksctl get cluster --name "$CLUSTER" --region "$REGION" >/dev/null 2>&1; then
-            cat > cluster.yaml <<'YAML'
-apiVersion: eksctl.io/v1alpha5
-kind: ClusterConfig
-metadata:
-  name: __CLUSTER__
-  region: __REGION__
-  version: "1.29"
-managedNodeGroups:
-- name: ng-1
-  instanceType: t3.medium
-  desiredCapacity: 2
-  minSize: 2
-  maxSize: 3
-  labels:
-    role: worker
-  ssh:
-    allow: false
-YAML
-            sed -i "s#__CLUSTER__#${CLUSTER}#g;s#__REGION__#${REGION}#g" cluster.yaml
-            eksctl create cluster -f cluster.yaml
+            eksctl create cluster \
+              --name "$CLUSTER" \
+              --region "$REGION" \
+              --version "1.29" \
+              --managed \
+              --nodegroup-name ng-1 \
+              --node-type t3.medium \
+              --nodes 2 \
+              --nodes-min 2 \
+              --nodes-max 3
           else
             echo "Cluster ${CLUSTER} already exists."
           fi
