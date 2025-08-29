@@ -1,45 +1,167 @@
-name: Build & Deploy to EKS
+name: Provision & Deploy to EKS
 
 on:
   push:
     branches: [ main ]
+  workflow_dispatch: {}
+
+env:
+  REGION: ap-south-1               # or use: ${{ secrets.AWS_REGION }}
+  CLUSTER: hello-eks               # hard-coded so --name is never empty
+  ECR_URI: ${{ secrets.ECR_URI }}  # e.g. 003364514435.dkr.ecr.ap-south-1.amazonaws.com/hello-eks
+  BUCKET_NAME: ${{ secrets.BUCKET_NAME }} # optional; leave empty to auto-create
 
 jobs:
-  build-deploy:
+  infra-build-deploy:
     runs-on: ubuntu-latest
-    env:
-      AWS_REGION: ${{ secrets.AWS_REGION }}
+    permissions:
+      id-token: write
+      contents: read
 
     steps:
     - uses: actions/checkout@v4
 
-    - name: Configure AWS creds
+    - name: Configure AWS credentials
       uses: aws-actions/configure-aws-credentials@v4
       with:
         aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region:            ${{ secrets.AWS_REGION }}
+        aws-region:            ${{ env.REGION }}
 
-    - name: Login to ECR
-      id: ecr
-      uses: aws-actions/amazon-ecr-login@v2
-
-    - name: Build & push image
+    - name: Install eksctl & kubectl
       run: |
-        IMAGE=${{ secrets.ECR_REGISTRY }}/hello-eks:${{ github.sha }}
-        docker build -t $IMAGE ./app
-        docker push $IMAGE
+        set -e
+        curl -sSL "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_$(uname -s)_amd64.tar.gz" | tar xz -C /usr/local/bin
+        curl -sSLo /usr/local/bin/kubectl https://dl.k8s.io/release/$(curl -Ls https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl
+        chmod +x /usr/local/bin/kubectl
+        eksctl version && kubectl version --client
+
+    - name: Parse ECR URI into registry/repo
+      id: ecrparse
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [ -z "${ECR_URI}" ]; then
+          echo "ECR_URI secret is required (e.g. 003364514435.dkr.ecr.ap-south-1.amazonaws.com/hello-eks)"; exit 1
+        fi
+        REGISTRY="${ECR_URI%/*}"      # 003364...amazonaws.com
+        REPO="${ECR_URI##*/}"         # hello-eks
+        echo "REGISTRY=$REGISTRY" >> $GITHUB_ENV
+        echo "REPO=$REPO" >> $GITHUB_ENV
+
+    - name: Ensure ECR repo exists
+      run: |
+        aws ecr describe-repositories --repository-names "$REPO" --region "$REGION" \
+          || aws ecr create-repository --repository-name "$REPO" --region "$REGION"
+
+    - name: Ensure S3 bucket exists (or create one)
+      shell: bash
+      run: |
+        set -euo pipefail
+        ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+        if [ -n "${BUCKET_NAME}" ]; then
+          BUCKET="${BUCKET_NAME}"
+        else
+          SHORT=${GITHUB_SHA::7}
+          BUCKET="hello-eks-${ACCOUNT}-${REGION}-${SHORT}"
+        fi
+        if ! aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
+          aws s3api create-bucket --bucket "$BUCKET" --region "$REGION" \
+            --create-bucket-configuration LocationConstraint="$REGION"
+          echo "Created bucket $BUCKET"
+        fi
+        echo "BUCKET=$BUCKET" >> $GITHUB_ENV
+        echo "Bucket=$BUCKET"
+
+    - name: Create EKS cluster if missing (eksctl)
+      shell: bash
+      run: |
+        set -euo pipefail
+        if ! eksctl get cluster --name "$CLUSTER" --region "$REGION" >/dev/null 2>&1; then
+          cat > cluster.yaml <<YAML
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+metadata:
+  name: ${CLUSTER}
+  region: ${REGION}
+  version: "1.29"
+managedNodeGroups:
+- name: ng-1
+  instanceType: t3.medium
+  desiredCapacity: 2
+  minSize: 2
+  maxSize: 3
+  labels: { role: worker }
+  ssh:
+    allow: false
+iam:
+  withOIDC: true
+YAML
+          eksctl create cluster -f cluster.yaml
+        else
+          echo "Cluster ${CLUSTER} already exists."
+        fi
+        aws eks update-kubeconfig --name "$CLUSTER" --region "$REGION"
+
+    - name: Ensure OIDC and IRSA for S3 write
+      shell: bash
+      run: |
+        set -euo pipefail
+        eksctl utils associate-iam-oidc-provider --region "$REGION" --cluster "$CLUSTER" --approve || true
+        POLICY_NAME="${CLUSTER}-s3-policy"
+        POLICY_ARN=$(aws iam list-policies --scope Local --query "Policies[?PolicyName=='${POLICY_NAME}'].Arn" --output text)
+        if [ -z "$POLICY_ARN" ]; then
+          cat > s3-policy.json <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Effect": "Allow", "Action": ["s3:ListBucket"], "Resource": ["arn:aws:s3:::${BUCKET}"] },
+    { "Effect": "Allow", "Action": ["s3:GetObject","s3:PutObject"], "Resource": ["arn:aws:s3:::${BUCKET}/*"] }
+  ]
+}
+EOF
+          POLICY_ARN=$(aws iam create-policy --policy-name "$POLICY_NAME" --policy-document file://s3-policy.json --query Policy.Arn --output text)
+          echo "Created policy $POLICY_ARN"
+        fi
+        eksctl create iamserviceaccount \
+          --name app-writer \
+          --namespace default \
+          --cluster "$CLUSTER" \
+          --attach-policy-arn "$POLICY_ARN" \
+          --approve \
+          --override-existing-serviceaccounts
+
+    - name: Login to ECR, Build & Push image
+      shell: bash
+      run: |
+        set -euo pipefail
+        aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "$REGISTRY"
+        IMAGE="$REGISTRY/$REPO:${GITHUB_SHA}"
+        docker build -t "$IMAGE" ./app
+        docker push "$IMAGE"
         echo "IMAGE=$IMAGE" >> $GITHUB_ENV
 
-    - name: Update kubeconfig
+    - name: Render & Apply manifests
+      shell: bash
       run: |
-        aws eks update-kubeconfig --name ${{ secrets.EKS_CLUSTER_NAME }} --region ${{ secrets.AWS_REGION }}
-
-    - name: Render and apply manifests
-      run: |
+        set -euo pipefail
+        IRSA_ARN=$(kubectl get sa app-writer -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}')
         mkdir -p k8s_render
-        sed "s#__TAG__#${{ github.sha }}#g; s#<ECR_REGISTRY>#${{ secrets.ECR_REGISTRY }}#g; s#<BUCKET_NAME>#${{ secrets.BUCKET_NAME }}#g" k8s/deploy.yaml > k8s_render/deploy.yaml
-        kubectl apply -f k8s/sa-irsa.yaml
+        sed -e "s#__IRSA_ROLE_ARN__#${IRSA_ARN}#g" \
+            -e "s#__IMAGE__#${IMAGE}#g" \
+            -e "s#__BUCKET__#${BUCKET}#g" \
+            -e "s#__REGION__#${REGION}#g" \
+            k8s/deploy.tmpl.yaml > k8s_render/deploy.yaml
         kubectl apply -f k8s_render/deploy.yaml
         kubectl apply -f k8s/svc.yaml
         kubectl rollout status deploy/hello-eks
+
+    - name: Print Service external hostname
+      shell: bash
+      run: |
+        for i in {1..30}; do
+          HN=$(kubectl get svc hello-eks-svc -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+          [ -n "$HN" ] && break
+          echo "waiting for external hostname... ($i/30)"; sleep 8
+        done
+        echo "URL: http://${HN:-<pending>}/"
