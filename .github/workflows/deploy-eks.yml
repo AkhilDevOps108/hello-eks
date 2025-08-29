@@ -1,4 +1,4 @@
-name: Provision & Deploy to EKS
+name: Deploy to EKS
 
 on:
   push:
@@ -8,82 +8,83 @@ on:
 env:
   REGION: ap-south-1
   CLUSTER: hello-eks
-  ECR_URI: ${{ secrets.ECR_URI }}
-  BUCKET_NAME: ${{ secrets.BUCKET_NAME }}
+  ECR_URI: ${{ secrets.ECR_URI }}          # e.g. 003364514435.dkr.ecr.ap-south-1.amazonaws.com/hello-eks
+  BUCKET_NAME: ${{ secrets.BUCKET_NAME }}  # optional; leave empty to auto-create
 
 jobs:
-  infra-build-deploy:
+  deploy:
     runs-on: ubuntu-latest
     permissions:
       id-token: write
       contents: read
 
     steps:
-    - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    - name: Configure AWS credentials
-      uses: aws-actions/configure-aws-credentials@v4
-      with:
-        aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region:            ${{ env.REGION }}
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.REGION }}
 
-    - name: Install eksctl & kubectl
-      run: |
-        set -e
-        curl -sSL "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_$(uname -s)_amd64.tar.gz" | tar xz -C /usr/local/bin
-        curl -sSLo /usr/local/bin/kubectl https://dl.k8s.io/release/$(curl -Ls https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl
-        chmod +x /usr/local/bin/kubectl
-        eksctl version && kubectl version --client
+      - name: Install eksctl & kubectl
+        run: |
+          set -e
+          curl -sSL "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_$(uname -s)_amd64.tar.gz" | tar xz -C /usr/local/bin
+          curl -sSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/$(curl -Ls https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x /usr/local/bin/kubectl
+          eksctl version
+          kubectl version --client
 
-    - name: Parse ECR URI into registry/repo
-      id: ecrparse
-      shell: bash
-      run: |
-        set -euo pipefail
-        if [ -z "${ECR_URI}" ]; then
-          echo "ECR_URI secret is required (e.g. 003364...amazonaws.com/hello-eks)"; exit 1
-        fi
-        REGISTRY="${ECR_URI%/*}"
-        REPO="${ECR_URI##*/}"
-        echo "REGISTRY=$REGISTRY" >> $GITHUB_ENV
-        echo "REPO=$REPO" >> $GITHUB_ENV
+      - name: Parse ECR URI (registry/repo)
+        id: ecrparse
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${ECR_URI}" ]; then
+            echo "Secret ECR_URI is required (e.g. 003364...amazonaws.com/hello-eks)"; exit 1
+          fi
+          REGISTRY="${ECR_URI%/*}"     # 003364...amazonaws.com
+          REPO="${ECR_URI##*/}"        # hello-eks
+          echo "REGISTRY=$REGISTRY" >> "$GITHUB_ENV"
+          echo "REPO=$REPO" >> "$GITHUB_ENV"
 
-    - name: Ensure ECR repo exists
-      run: |
-        aws ecr describe-repositories --repository-names "$REPO" --region "$REGION" \
-          || aws ecr create-repository --repository-name "$REPO" --region "$REGION"
+      - name: Ensure ECR repo exists
+        run: |
+          aws ecr describe-repositories --repository-names "$REPO" --region "$REGION" \
+            || aws ecr create-repository --repository-name "$REPO" --region "$REGION"
 
-    - name: Ensure S3 bucket exists (or create one)
-      shell: bash
-      run: |
-        set -euo pipefail
-        ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
-        if [ -n "${BUCKET_NAME}" ]; then
-          BUCKET="${BUCKET_NAME}"
-        else
-          SHORT=${GITHUB_SHA::7}
-          BUCKET="hello-eks-${ACCOUNT}-${REGION}-${SHORT}"
-        fi
-        if ! aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
-          aws s3api create-bucket --bucket "$BUCKET" --region "$REGION" \
-            --create-bucket-configuration LocationConstraint="$REGION"
-          echo "Created bucket $BUCKET"
-        fi
-        echo "BUCKET=$BUCKET" >> $GITHUB_ENV
-        echo "Bucket=$BUCKET"
+      - name: Ensure S3 bucket exists (or create one)
+        shell: bash
+        run: |
+          set -euo pipefail
+          ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
+          if [ -n "${BUCKET_NAME}" ]; then
+            BUCKET="${BUCKET_NAME}"
+          else
+            SHORT="${GITHUB_SHA::7}"
+            BUCKET="hello-eks-${ACCOUNT}-${REGION}-${SHORT}"
+          fi
+          if ! aws s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
+            aws s3api create-bucket --bucket "$BUCKET" --region "$REGION" \
+              --create-bucket-configuration LocationConstraint="$REGION"
+            echo "Created bucket $BUCKET"
+          fi
+          echo "BUCKET=$BUCKET" >> "$GITHUB_ENV"
 
-    - name: Create EKS cluster if missing (eksctl)
-      shell: bash
-      run: |
-        set -euo pipefail
-        if ! eksctl get cluster --name "$CLUSTER" --region "$REGION" >/dev/null 2>&1; then
-          cat > cluster.yaml <<YAML
+      - name: Create EKS cluster if missing (eksctl)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! eksctl get cluster --name "$CLUSTER" --region "$REGION" >/dev/null 2>&1; then
+            cat > cluster.yaml <<'YAML'
 apiVersion: eksctl.io/v1alpha5
 kind: ClusterConfig
 metadata:
-  name: ${CLUSTER}
-  region: ${REGION}
+  name: __CLUSTER__
+  region: __REGION__
   version: "1.29"
 managedNodeGroups:
 - name: ng-1
@@ -91,52 +92,55 @@ managedNodeGroups:
   desiredCapacity: 2
   minSize: 2
   maxSize: 3
-  labels: { role: worker }
-  ssh: { allow: false }
-   YAML
-          eksctl create cluster -f cluster.yaml
-        else
-          echo "Cluster ${CLUSTER} already exists."
-        fi
-        aws eks update-kubeconfig --name "$CLUSTER" --region "$REGION"
+  labels:
+    role: worker
+  ssh:
+    allow: false
+YAML
+            sed -i "s#__CLUSTER__#${CLUSTER}#g;s#__REGION__#${REGION}#g" cluster.yaml
+            eksctl create cluster -f cluster.yaml
+          else
+            echo "Cluster ${CLUSTER} already exists."
+          fi
+          aws eks update-kubeconfig --name "$CLUSTER" --region "$REGION"
 
-    - name: Login to ECR, Build & Push image
-      shell: bash
-      run: |
-        set -euo pipefail
-        aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "$REGISTRY"
-        IMAGE="$REGISTRY/$REPO:${GITHUB_SHA}"
-        docker build -t "$IMAGE" ./app
-        docker push "$IMAGE"
-        echo "IMAGE=$IMAGE" >> $GITHUB_ENV
+      - name: Login to ECR, Build & Push image
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "$REGISTRY"
+          IMAGE="$REGISTRY/$REPO:${GITHUB_SHA}"
+          docker build -t "$IMAGE" ./app
+          docker push "$IMAGE"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
 
-    - name: Create AWS creds secret in cluster (for pod)
-      shell: bash
-      run: |
-        kubectl delete secret aws-creds --ignore-not-found
-        kubectl create secret generic aws-creds \
-          --from-literal=AWS_ACCESS_KEY_ID='${{ secrets.AWS_ACCESS_KEY_ID }}' \
-          --from-literal=AWS_SECRET_ACCESS_KEY='${{ secrets.AWS_SECRET_ACCESS_KEY }}'
+      - name: Create AWS creds secret in cluster (for pod)
+        shell: bash
+        run: |
+          kubectl delete secret aws-creds --ignore-not-found
+          kubectl create secret generic aws-creds \
+            --from-literal=AWS_ACCESS_KEY_ID='${{ secrets.AWS_ACCESS_KEY_ID }}' \
+            --from-literal=AWS_SECRET_ACCESS_KEY='${{ secrets.AWS_SECRET_ACCESS_KEY }}'
 
-    - name: Render & Apply manifests (no IRSA)
-      shell: bash
-      run: |
-        set -euo pipefail
-        mkdir -p k8s_render
-        sed -e "s#__IMAGE__#${IMAGE}#g" \
-            -e "s#__BUCKET__#${BUCKET}#g" \
-            -e "s#__REGION__#${REGION}#g" \
-            k8s/deploy.tmpl.yaml > k8s_render/deploy.yaml
-        kubectl apply -f k8s_render/deploy.yaml
-        kubectl apply -f k8s/svc.yaml
-        kubectl rollout status deploy/hello-eks
+      - name: Render & Apply manifests
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p k8s_render
+          sed -e "s#__IMAGE__#${IMAGE}#g" \
+              -e "s#__BUCKET__#${BUCKET}#g" \
+              -e "s#__REGION__#${REGION}#g" \
+              k8s/deploy.tmpl.yaml > k8s_render/deploy.yaml
+          kubectl apply -f k8s_render/deploy.yaml
+          kubectl apply -f k8s/svc.yaml
+          kubectl rollout status deploy/hello-eks
 
-    - name: Print Service external hostname
-      shell: bash
-      run: |
-        for i in {1..30}; do
-          HN=$(kubectl get svc hello-eks-svc -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
-          [ -n "$HN" ] && break
-          echo "waiting for external hostname... ($i/30)"; sleep 8
-        done
-        echo "URL: http://${HN:-<pending>}/"
+      - name: Print Service external hostname
+        shell: bash
+        run: |
+          for i in {1..30}; do
+            HN="$(kubectl get svc hello-eks-svc -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)"
+            [ -n "$HN" ] && break
+            echo "waiting for external hostname... ($i/30)"; sleep 8
+          done
+          echo "URL: http://${HN:-<pending>}/"
