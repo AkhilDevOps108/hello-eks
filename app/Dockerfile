@@ -6,3 +6,4 @@ COPY . .
 EXPOSE 8080
 USER 10001
 CMD ["npm","start"]
+#
